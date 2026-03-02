@@ -32,8 +32,17 @@ class HardwareDetector:
         except:
             pass
             
-        # Более детальная информация для Windows
-        if self.os_type == "Windows":
+        # Better CPU name on Linux
+        if self.os_type == "Linux":
+            try:
+                with open("/proc/cpuinfo", "r") as f:
+                    for line in f:
+                        if line.startswith("model name"):
+                            info["name"] = line.split(":", 1)[1].strip()
+                            break
+            except:
+                pass
+        elif self.os_type == "Windows":
             try:
                 result = subprocess.run(
                     ["wmic", "cpu", "get", "name"],
@@ -186,7 +195,7 @@ class HardwareDetector:
                     pass
                     
         elif self.os_type == "Linux":
-            # Для Linux можно использовать lspci
+            # Для Linux используем lspci и rocm-smi для AMD GPU
             try:
                 result = subprocess.run(
                     ["lspci"],
@@ -195,19 +204,86 @@ class HardwareDetector:
                     timeout=5
                 )
                 for line in result.stdout.split('\n'):
-                    if "VGA" in line or "3D" in line:
-                        if "AMD" in line or "ATI" in line:
-                            gpus.append({
-                                "name": line.split(': ')[1] if ': ' in line else line,
-                                "type": "AMD",
-                                "backend": "Vulkan or ROCm"
-                            })
-                        elif "Intel" in line:
-                            gpus.append({
-                                "name": line.split(': ')[1] if ': ' in line else line,
-                                "type": "Intel",
-                                "backend": "Vulkan or SYCL"
-                            })
+                    if "VGA" in line or "3D" in line or "Display" in line:
+                        # Extract GPU name from lspci output
+                        gpu_name = line.split(': ')[1] if ': ' in line else line
+                        gpu_entry = {
+                            "name": gpu_name,
+                            "type": "Unknown",
+                            "backend": "Unknown"
+                        }
+                        
+                        line_upper = line.upper()
+                        if "AMD" in line_upper or "ATI" in line_upper or "RADEON" in line_upper:
+                            gpu_entry["type"] = "AMD"
+                            gpu_entry["backend"] = "ROCm or Vulkan"
+                            if "9070" in line or "9080" in line or "9050" in line or "NAVI 4" in line_upper:
+                                gpu_entry["is_rdna4"] = True
+                        elif "NVIDIA" in line_upper:
+                            gpu_entry["type"] = "NVIDIA"
+                            gpu_entry["backend"] = "CUDA"
+                        elif "INTEL" in line_upper:
+                            gpu_entry["type"] = "Intel"
+                            gpu_entry["backend"] = "Vulkan or SYCL"
+                        
+                        gpus.append(gpu_entry)
+            except:
+                pass
+            
+            # Try to get AMD GPU VRAM info from rocm-smi or amd-smi
+            try:
+                result = subprocess.run(
+                    ["rocm-smi", "--showmeminfo", "vram"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    import re
+                    total_match = re.search(r'Total.*?:\s*(\d+)', result.stdout)
+                    if total_match:
+                        vram_bytes = int(total_match.group(1))
+                        vram_mb = vram_bytes / (1024 * 1024)
+                        for gpu in gpus:
+                            if gpu["type"] == "AMD":
+                                gpu["memory"] = f"{vram_mb:.0f} MiB"
+            except:
+                pass
+            
+            # Alternative: try amd-smi (ROCm 6+)
+            if gpus and not any("memory" in g for g in gpus if g.get("type") == "AMD"):
+                try:
+                    result = subprocess.run(
+                        ["amd-smi", "static", "--vram"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0:
+                        import re
+                        size_match = re.search(r'(\d+)\s*MB', result.stdout)
+                        if size_match:
+                            for gpu in gpus:
+                                if gpu["type"] == "AMD":
+                                    gpu["memory"] = f"{size_match.group(1)} MiB"
+                except:
+                    pass
+            
+            # Try to get GPU architecture from rocminfo
+            try:
+                result = subprocess.run(
+                    ["rocminfo"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    import re
+                    gfx_matches = re.findall(r'Name:\s+(gfx\d+)', result.stdout)
+                    if gfx_matches:
+                        for gpu in gpus:
+                            if gpu["type"] == "AMD":
+                                gpu["architecture"] = gfx_matches[0]
             except:
                 pass
                 
@@ -325,7 +401,19 @@ class HardwareDetector:
     
     def _check_rocm(self) -> bool:
         """Check for ROCm installation"""
-        if self.os_type == "Windows":
+        if self.os_type == "Linux":
+            # On Linux, check /opt/rocm
+            rocm_root = Path("/opt/rocm")
+            if rocm_root.exists():
+                if (rocm_root / "bin" / "amdclang++").exists():
+                    return True
+                if (rocm_root / "bin" / "hipcc").exists():
+                    return True
+            rocm_path = os.environ.get("ROCM_PATH", "")
+            if rocm_path and Path(rocm_path).exists():
+                return True
+            return False
+        elif self.os_type == "Windows":
             # Check standard ROCm paths on Windows
             rocm_paths = [
                 Path("C:/Program Files/AMD/ROCm"),
@@ -338,7 +426,6 @@ class HardwareDetector:
                     return True
             return False
         else:
-            # On Linux, check for hipcc command
             return self._check_command("hipcc")
     
     def is_rocm_available(self) -> bool:

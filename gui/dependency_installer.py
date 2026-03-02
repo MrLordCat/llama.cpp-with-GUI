@@ -434,7 +434,19 @@ class DependencyManager:
         
     def _check_rocm(self) -> bool:
         """Check for ROCm installation"""
-        if self.os_type == "Windows":
+        if self.os_type == "Linux":
+            # On Linux, check /opt/rocm directory
+            rocm_root = Path("/opt/rocm")
+            if rocm_root.exists():
+                if (rocm_root / "bin" / "amdclang++").exists():
+                    return True
+                if (rocm_root / "bin" / "hipcc").exists():
+                    return True
+            rocm_path = os.environ.get("ROCM_PATH", "")
+            if rocm_path and Path(rocm_path).exists():
+                return True
+            return False
+        elif self.os_type == "Windows":
             # Check standard ROCm paths on Windows
             rocm_paths = [
                 Path("C:/Program Files/AMD/ROCm"),
@@ -447,7 +459,6 @@ class DependencyManager:
                     return True
             return False
         else:
-            # On Linux, check for hipcc command
             return self._check_tool("hipcc")
     
     def initialize_msvc_env(self) -> bool:

@@ -53,6 +53,9 @@ class ServerThread(QThread):
             if self.env:
                 process_env.update(self.env)
             
+            # On Linux: lower CPU scheduler priority so desktop stays responsive under GPU load
+            _preexec = (lambda: os.nice(10)) if os.name != 'nt' else None
+
             self.process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
@@ -61,7 +64,8 @@ class ServerThread(QThread):
                 cwd=self.working_dir,
                 bufsize=1,
                 universal_newlines=True,
-                env=process_env
+                env=process_env,
+                preexec_fn=_preexec
             )
             
             server_started = False
@@ -250,7 +254,7 @@ class LlamaCppGUI(QMainWindow):
         # User's home directory
         home = Path.home()
         
-        # Common development folders
+        # Common development folders (cross-platform)
         common_folders = [
             home / "Documents" / "GitHub" / "llama.cpp",
             home / "Documents" / "GitHub" / "llama.cpp-with-GUI",
@@ -260,11 +264,23 @@ class LlamaCppGUI(QMainWindow):
             home / "code" / "llama.cpp",
             home / "git" / "llama.cpp",
             home / "llama.cpp",
-            Path("C:/llama.cpp"),
-            Path("D:/llama.cpp"),
-            Path("C:/GitHub/llama.cpp"),
-            Path("D:/GitHub/llama.cpp"),
         ]
+        
+        # Add platform-specific paths
+        if platform.system() == "Windows":
+            common_folders.extend([
+                Path("C:/llama.cpp"),
+                Path("D:/llama.cpp"),
+                Path("C:/GitHub/llama.cpp"),
+                Path("D:/GitHub/llama.cpp"),
+            ])
+        else:
+            # Linux/macOS paths
+            common_folders.extend([
+                home / "src" / "llama.cpp",
+                home / "repos" / "llama.cpp",
+                Path("/opt/llama.cpp"),
+            ])
         
         # Add variations with -with-GUI suffix
         for folder in common_folders.copy():
@@ -632,7 +648,20 @@ class LlamaCppGUI(QMainWindow):
         backend_layout.addWidget(self.server_backend_combo)
         backend_layout.addStretch()
         server_params_layout.addLayout(backend_layout)
-        
+
+        # Skip warmup (recommended on Linux/ROCm to avoid OOM during warmup)
+        self.server_no_warmup_checkbox = QCheckBox("Skip warmup (--no-warmup) — recommended on Linux/ROCm")
+        self.server_no_warmup_checkbox.setChecked(os.name != 'nt')  # ON by default on Linux/Mac
+        server_params_layout.addWidget(self.server_no_warmup_checkbox)
+
+        # Extra arguments
+        extra_args_layout = QHBoxLayout()
+        extra_args_layout.addWidget(QLabel("Extra Arguments:"))
+        self.server_extra_args_edit = QLineEdit()
+        self.server_extra_args_edit.setPlaceholderText("e.g. --parallel 1 --mlock  (space separated)")
+        extra_args_layout.addWidget(self.server_extra_args_edit)
+        server_params_layout.addLayout(extra_args_layout)
+
         server_params_group.setLayout(server_params_layout)
         layout.addWidget(server_params_group)
         
@@ -1537,10 +1566,22 @@ class LlamaCppGUI(QMainWindow):
         if self.server_gpu_checkbox.isChecked():
             command.extend(backend_args.get(backend_idx, []))
             
-        # CORS
-        if self.server_cors_checkbox.isChecked():
-            command.extend(["--cors", "*"])
-            
+        # CORS - now built-in to llama-server (no flag needed)
+        # The checkbox is kept for UI consistency but --cors flag was removed upstream
+
+        # Skip warmup if checkbox is set (avoids OOM crash during warmup on ROCm/Linux)
+        if self.server_no_warmup_checkbox.isChecked():
+            command.append("--no-warmup")
+
+        # Extra user-defined arguments
+        extra_args_text = self.server_extra_args_edit.text().strip()
+        if extra_args_text:
+            import shlex
+            try:
+                command.extend(shlex.split(extra_args_text))
+            except ValueError:
+                command.extend(extra_args_text.split())
+
         # API ключ
         api_key = self.server_api_key_edit.text().strip()
         if api_key:
@@ -1568,7 +1609,15 @@ class LlamaCppGUI(QMainWindow):
                 self.server_output_text.append(f"🎯 ROCm environment loaded (HIP SDK {rocm_version or 'unknown'})\n")
                 if "HSA_OVERRIDE_GFX_VERSION" in server_env:
                     self.server_output_text.append(f"⚠️ RDNA4 compatibility mode: HSA_OVERRIDE_GFX_VERSION={server_env['HSA_OVERRIDE_GFX_VERSION']}\n")
-                    self.server_output_text.append(f"   💡 Upgrade to HIP SDK 6.4+ for native RDNA4 support\n")
+                    rocm_ver = self.build_manager.detect_rocm_version()
+                    try:
+                        mm = float(rocm_ver.split('.')[0] + '.' + rocm_ver.split('.')[1]) if rocm_ver else 0
+                    except Exception:
+                        mm = 0
+                    if mm < 6.4:
+                        self.server_output_text.append(f"   💡 Upgrade to HIP SDK 6.4+ for native RDNA4 support\n")
+                    else:
+                        self.server_output_text.append(f"   ℹ️ HSA_OVERRIDE_GFX_VERSION inherited from system env (not needed with ROCm {rocm_ver})\n")
                 self.server_output_text.append("\n")
         
         # Running in separate thread
@@ -2109,7 +2158,7 @@ class LlamaCppGUI(QMainWindow):
                 for tool_name in missing_tools:
                     tool_info = DependencyChecker.SYSTEM_TOOLS.get(tool_name, {})
                     self.build_log.append(f"  • {tool_name}: {tool_info.get('description', '')}\n")
-                    self.build_log.append(f"    Install: {tool_info.get('install_hint', 'N/A')}\n")
+                    self.build_log.append(f"    Install: {DependencyChecker.get_install_hint(tool_name)}\n")
                 
                 reply = QMessageBox.question(
                     self,
@@ -2128,7 +2177,7 @@ class LlamaCppGUI(QMainWindow):
                         else:
                             tool_info = DependencyChecker.SYSTEM_TOOLS.get(tool_name, {})
                             self.build_log.append(f"❌ Failed to install {tool_name}\n")
-                            self.build_log.append(f"   Please run manually: {tool_info.get('install_hint', 'N/A')}\n")
+                            self.build_log.append(f"   Please run manually: {DependencyChecker.get_install_hint(tool_name)}\n")
                             return
                     self.build_log.append("\n✅ All tools installed. Please restart the application.\n")
                     QMessageBox.information(

@@ -94,9 +94,11 @@ class BuildThread(QThread):
                 parts = action.split()
                 if parts:
                     filename = parts[-1].split('/')[-1].split('\\')[-1]
-                    # Remove .obj suffix for cleaner display
+                    # Remove .obj/.o suffix for cleaner display
                     if filename.endswith('.obj'):
                         filename = filename[:-4]
+                    elif filename.endswith('.o'):
+                        filename = filename[:-2]
             return current, total, filename
         return None, None, None
         
@@ -323,65 +325,56 @@ class BuildManager:
             return None
         
     def get_rocm_env(self) -> Optional[Dict[str, str]]:
-        """Get environment variables for ROCm on Windows"""
-        if self.os_type != "Windows":
-            return None
-        
-        # Start with current environment (ROCm uses clang, not MSVC)
+        """Get environment variables for ROCm builds (Linux and Windows)"""
         env = os.environ.copy()
         
-        # Find ROCm installation
-        rocm_paths = [
-            Path("C:/Program Files/AMD/ROCm"),
-        ]
-        
-        rocm_root = None
-        for path in rocm_paths:
-            if path.exists():
-                # Find latest version
-                versions = list(path.iterdir())
-                if versions:
-                    rocm_root = sorted(versions, reverse=True)[0]
-                    break
-        
-        if not rocm_root:
-            return env if env else None
-        
-        # Add ROCm paths to environment
-        hip_path = rocm_root / "bin"
-        cmake_prefix = rocm_root / "lib" / "cmake"
-        
-        if hip_path.exists():
-            current_path = env.get("PATH", "")
-            
-            # Add Strawberry Perl to PATH if installed (required for HIP)
-            perl_paths = [
-                "C:\\Strawberry\\perl\\bin",
-                "C:\\Strawberry\\c\\bin",
-                "C:\\Perl64\\bin",
-                "C:\\Perl\\bin",
+        if self.os_type == "Linux":
+            # Linux ROCm setup
+            rocm_root = None
+            rocm_candidates = [
+                Path("/opt/rocm"),
+                Path(os.environ.get("ROCM_PATH", "/opt/rocm")),
             ]
-            extra_paths = [p for p in perl_paths if Path(p).exists()]
+            for candidate in rocm_candidates:
+                if candidate.exists():
+                    rocm_root = candidate
+                    break
             
-            # Build complete PATH: ROCm first, then Perl, then existing (which includes MSVC)
-            path_parts = [str(hip_path), str(rocm_root)] + extra_paths + [current_path]
-            env["PATH"] = ";".join(path_parts)
+            if not rocm_root:
+                return env
             
-            env["HIP_PATH"] = str(rocm_root)
+            # Add ROCm paths to environment
+            rocm_bin = rocm_root / "bin"
+            rocm_lib = rocm_root / "lib"
+            cmake_prefix = rocm_root / "lib" / "cmake"
+            
+            current_path = env.get("PATH", "")
+            # Ensure ROCm bin is first in PATH (overrides broken system hipcc)
+            if str(rocm_bin) not in current_path:
+                env["PATH"] = f"{rocm_bin}:{current_path}"
+            
+            current_ld_path = env.get("LD_LIBRARY_PATH", "")
+            if str(rocm_lib) not in current_ld_path:
+                env["LD_LIBRARY_PATH"] = f"{rocm_lib}:{current_ld_path}"
+            
             env["ROCM_PATH"] = str(rocm_root)
-            # Critical: Set HIP_PLATFORM for AMD GPUs
+            env["HIP_PATH"] = str(rocm_root)
             env["HIP_PLATFORM"] = "amd"
-            env["HIP_COMPILER"] = "clang"
+            # Set HIPCXX to use ROCm's amdclang++ instead of broken system hipcc
+            amdclang_cxx = rocm_root / "bin" / "amdclang++"
+            if amdclang_cxx.exists():
+                env["HIPCXX"] = str(amdclang_cxx)
+                env["HIP_COMPILER"] = "clang"
+            if cmake_prefix.exists():
+                env["CMAKE_PREFIX_PATH"] = str(cmake_prefix)
             
-            # RDNA4 (gfx1201) workaround: ROCm/HIP SDK < 6.4 doesn't have rocBLAS kernels for gfx1201
-            # Force using gfx1100 (RDNA3) kernels which are compatible
-            # ROCm 6.4+ has native gfx1201 support, so workaround is not needed
+            # RDNA4 workaround for ROCm < 6.4
             rocm_version = self.detect_rocm_version()
             needs_rdna4_workaround = True
             if rocm_version:
                 try:
-                    # Parse version like "6.4" or "6.4.2"
-                    major_minor = float(rocm_version.split('.')[0] + '.' + rocm_version.split('.')[1])
+                    parts = rocm_version.split('.')
+                    major_minor = float(parts[0] + '.' + parts[1])
                     if major_minor >= 6.4:
                         needs_rdna4_workaround = False
                 except:
@@ -390,12 +383,76 @@ class BuildManager:
             if needs_rdna4_workaround:
                 detected_gpu = self.detect_amd_gpu_targets()
                 if detected_gpu and ("gfx1201" in detected_gpu or "gfx1200" in detected_gpu):
-                    env["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"  # Maps to gfx1100
+                    env["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"
+            else:
+                # ROCm >= 6.4 has native RDNA4 support, remove stale system override if present
+                env.pop("HSA_OVERRIDE_GFX_VERSION", None)
             
-            if cmake_prefix.exists():
-                env["CMAKE_PREFIX_PATH"] = str(cmake_prefix)
+            return env
         
-        return env if env else None
+        elif self.os_type == "Windows":
+            # Windows ROCm setup
+            rocm_paths = [
+                Path("C:/Program Files/AMD/ROCm"),
+            ]
+            
+            rocm_root = None
+            for path in rocm_paths:
+                if path.exists():
+                    versions = list(path.iterdir())
+                    if versions:
+                        rocm_root = sorted(versions, reverse=True)[0]
+                        break
+            
+            if not rocm_root:
+                return env if env else None
+            
+            hip_path = rocm_root / "bin"
+            cmake_prefix = rocm_root / "lib" / "cmake"
+            
+            if hip_path.exists():
+                current_path = env.get("PATH", "")
+                
+                perl_paths = [
+                    "C:\\Strawberry\\perl\\bin",
+                    "C:\\Strawberry\\c\\bin",
+                    "C:\\Perl64\\bin",
+                    "C:\\Perl\\bin",
+                ]
+                extra_paths = [p for p in perl_paths if Path(p).exists()]
+                
+                path_parts = [str(hip_path), str(rocm_root)] + extra_paths + [current_path]
+                env["PATH"] = ";".join(path_parts)
+                
+                env["HIP_PATH"] = str(rocm_root)
+                env["ROCM_PATH"] = str(rocm_root)
+                env["HIP_PLATFORM"] = "amd"
+                env["HIP_COMPILER"] = "clang"
+                
+                rocm_version = self.detect_rocm_version()
+                needs_rdna4_workaround = True
+                if rocm_version:
+                    try:
+                        major_minor = float(rocm_version.split('.')[0] + '.' + rocm_version.split('.')[1])
+                        if major_minor >= 6.4:
+                            needs_rdna4_workaround = False
+                    except:
+                        pass
+                
+                if needs_rdna4_workaround:
+                    detected_gpu = self.detect_amd_gpu_targets()
+                    if detected_gpu and ("gfx1201" in detected_gpu or "gfx1200" in detected_gpu):
+                        env["HSA_OVERRIDE_GFX_VERSION"] = "11.0.0"
+                else:
+                    # ROCm >= 6.4 has native RDNA4 support, remove stale system override if present
+                    env.pop("HSA_OVERRIDE_GFX_VERSION", None)
+                
+                if cmake_prefix.exists():
+                    env["CMAKE_PREFIX_PATH"] = str(cmake_prefix)
+            
+            return env if env else None
+        
+        return None
         
     def get_cmake_generator(self, backend: Optional[str] = None) -> Optional[str]:
         """Определение генератора CMake для платформы
@@ -403,7 +460,19 @@ class BuildManager:
         Args:
             backend: Backend type - ROCm requires Ninja generator
         """
-        if self.os_type == "Windows":
+        if self.os_type == "Linux":
+            # On Linux, ROCm works best with Ninja; also use Ninja if available
+            if backend and backend.upper() == "ROCM":
+                if self._check_generator("Ninja"):
+                    return "Ninja"
+                else:
+                    return None  # Will use Unix Makefiles default
+            # For other backends on Linux, prefer Ninja if available
+            if self._check_generator("Ninja"):
+                return "Ninja"
+            return None  # Use default (Unix Makefiles)
+        
+        elif self.os_type == "Windows":
             # ROCm/HIP requires Ninja generator (Visual Studio doesn't work with HIP)
             if backend and backend.upper() == "ROCM":
                 if self._check_generator("Ninja"):
@@ -488,17 +557,36 @@ class BuildManager:
                 # Set CMAKE_BUILD_TYPE for Ninja (single-config generator)
                 command.append("-DCMAKE_BUILD_TYPE=Release")
                 
-                # For Windows ROCm, must use clang/clang++ from ROCm (not MSVC)
-                # See docs/build.md for official instructions
+                # Set ROCm CMAKE_PREFIX_PATH for CMake to find HIP
                 rocm_env = self.get_rocm_env()
-                if rocm_env and "HIP_PATH" in rocm_env:
-                    hip_path = rocm_env["HIP_PATH"]
-                    clang_c = Path(hip_path) / "bin" / "clang.exe"
-                    clang_cxx = Path(hip_path) / "bin" / "clang++.exe"
+                
+                if self.os_type == "Linux":
+                    # On Linux, use amdclang/amdclang++ from ROCm
+                    rocm_root = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+                    amdclang_c = rocm_root / "bin" / "amdclang"
+                    amdclang_cxx = rocm_root / "bin" / "amdclang++"
                     
-                    if clang_c.exists() and clang_cxx.exists():
-                        command.append(f"-DCMAKE_C_COMPILER={clang_c}")
-                        command.append(f"-DCMAKE_CXX_COMPILER={clang_cxx}")
+                    if amdclang_c.exists() and amdclang_cxx.exists():
+                        command.append(f"-DCMAKE_C_COMPILER={amdclang_c}")
+                        command.append(f"-DCMAKE_CXX_COMPILER={amdclang_cxx}")
+                        # Set HIP compiler explicitly (avoids using broken system hipcc)
+                        command.append(f"-DCMAKE_HIP_COMPILER={amdclang_cxx}")
+                    
+                    # Set CMAKE_PREFIX_PATH for ROCm CMake modules
+                    cmake_prefix = rocm_root / "lib" / "cmake"
+                    if cmake_prefix.exists():
+                        command.append(f"-DCMAKE_PREFIX_PATH={rocm_root}")
+                
+                elif self.os_type == "Windows":
+                    # For Windows ROCm, must use clang/clang++ from ROCm (not MSVC)
+                    if rocm_env and "HIP_PATH" in rocm_env:
+                        hip_path = rocm_env["HIP_PATH"]
+                        clang_c = Path(hip_path) / "bin" / "clang.exe"
+                        clang_cxx = Path(hip_path) / "bin" / "clang++.exe"
+                        
+                        if clang_c.exists() and clang_cxx.exists():
+                            command.append(f"-DCMAKE_C_COMPILER={clang_c}")
+                            command.append(f"-DCMAKE_CXX_COMPILER={clang_cxx}")
                 
         # Дополнительные опции
         if additional_options:
@@ -507,6 +595,13 @@ class BuildManager:
                     command.append(f"-D{key}={'ON' if value else 'OFF'}")
                 else:
                     command.append(f"-D{key}={value}")
+        
+        # On Linux with single-config generators, always set CMAKE_BUILD_TYPE
+        # (ROCm already sets it above; for other backends, set it here)
+        if self.os_type == "Linux" and not (backend and backend.upper() == "ROCM"):
+            # Check if CMAKE_BUILD_TYPE was not already set by user options
+            if not any("CMAKE_BUILD_TYPE" in arg for arg in command):
+                command.append("-DCMAKE_BUILD_TYPE=Release")
                     
         return command
         
@@ -526,9 +621,10 @@ class BuildManager:
         """
         command = ["cmake", "--build", str(self.build_dir)]
         
-        # Ninja (used for ROCm) ignores --config flag, build type is set during configure
-        # Visual Studio uses --config flag
-        if not (backend and backend.upper() == "ROCM"):
+        # Single-config generators (Ninja, Unix Makefiles) ignore --config flag
+        # Multi-config generators (Visual Studio) need --config flag
+        # On Linux we always use single-config generators
+        if self.os_type == "Windows" and not (backend and backend.upper() == "ROCM"):
             command.extend(["--config", config])
         
         if jobs:
@@ -605,7 +701,9 @@ class BuildManager:
             elif backend_upper == "ROCM":
                 checks["rocm"] = self._check_rocm()
                 checks["ninja"] = self._check_ninja()
-                checks["perl"] = self._check_perl()
+                # Perl is only required for Windows ROCm builds
+                if self.os_type == "Windows":
+                    checks["perl"] = self._check_perl()
                 
         # Проверка компилятора
         if self.os_type == "Windows":
@@ -659,12 +757,36 @@ class BuildManager:
             program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
             vulkan_path = Path(program_files) / "VulkanSDK"
             return vulkan_path.exists()
+        elif self.os_type == "Linux":
+            # Check standard Linux Vulkan paths
+            if Path("/usr/share/vulkan").exists():
+                return True
+            # Check via vulkaninfo command
+            try:
+                result = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, timeout=5)
+                return result.returncode == 0
+            except:
+                pass
             
         return False
         
     def _check_rocm(self) -> bool:
         """Check for ROCm installation"""
-        if self.os_type == "Windows":
+        if self.os_type == "Linux":
+            # On Linux, check /opt/rocm and for amdclang++/hipcc
+            rocm_root = Path("/opt/rocm")
+            if rocm_root.exists():
+                # Check for amdclang++ (ROCm 6+) or hipcc
+                if (rocm_root / "bin" / "amdclang++").exists():
+                    return True
+                if (rocm_root / "bin" / "hipcc").exists():
+                    return True
+            # Also check common env vars
+            rocm_path = os.environ.get("ROCM_PATH", "")
+            if rocm_path and Path(rocm_path).exists():
+                return True
+            return False
+        elif self.os_type == "Windows":
             # Check standard ROCm paths on Windows
             rocm_paths = [
                 Path("C:/Program Files/AMD/ROCm"),
@@ -677,7 +799,6 @@ class BuildManager:
                     return True
             return False
         else:
-            # On Linux, check for hipcc command
             return self._check_tool("hipcc")
         
     def get_build_info(self) -> Dict[str, Any]:

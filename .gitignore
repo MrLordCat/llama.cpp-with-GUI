@@ -2,6 +2,7 @@
 
 *.a
 *.bat
+!start-gui.bat
 *.bin
 *.d
 *.dll
@@ -137,3 +138,10 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# GUI specific
+gui/__pycache__/
+gui/*.pyc
+*.ini
+*.conf
+.DS_Store

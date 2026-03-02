@@ -1,0 +1,16 @@
+# Дополнительные зависимости для GUI
+# Установка: pip install -r gui/requirements-gui.txt
+
+# GUI фреймворк
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+
+# Для загрузки моделей из HuggingFace
+huggingface-hub>=0.20.0
+requests>=2.31.0
+
+# Системная информация и мониторинг
+psutil>=5.9.0
+
+# Прогресс-бары и UI улучшения
+tqdm>=4.66.0

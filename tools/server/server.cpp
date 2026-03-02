@@ -66,7 +66,7 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
-int main(int argc, char ** argv, char ** envp) {
+int main(int argc, char ** argv) {
     // own arguments required by this example
     common_params params;
 
@@ -92,7 +92,7 @@ int main(int argc, char ** argv, char ** envp) {
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
     if (params.model_alias.empty() && !params.model.name.empty()) {
-        params.model_alias = params.model.name;
+        params.model_alias.insert(params.model.name);
     }
 
     common_init();
@@ -119,14 +119,14 @@ int main(int argc, char ** argv, char ** envp) {
     //
 
     // register API routes
-    server_routes routes(params, ctx_server, [&ctx_http]() { return ctx_http.is_ready.load(); });
+    server_routes routes(params, ctx_server);
 
     bool is_router_server = params.model.path.empty();
     std::optional<server_models_routes> models_routes{};
     if (is_router_server) {
         // setup server instances manager
         try {
-            models_routes.emplace(params, argc, argv, envp);
+            models_routes.emplace(params, argc, argv);
         } catch (const std::exception & e) {
             LOG_ERR("%s: failed to initialize router models: %s\n", __func__, e.what());
             return 1;
@@ -140,6 +140,7 @@ int main(int argc, char ** argv, char ** envp) {
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
         routes.post_chat_completions       = models_routes->proxy_post;
+        routes.post_responses_oai          = models_routes->proxy_post;
         routes.post_anthropic_messages     = models_routes->proxy_post;
         routes.post_anthropic_count_tokens = models_routes->proxy_post;
         routes.post_infill                 = models_routes->proxy_post;
@@ -176,6 +177,8 @@ int main(int argc, char ** argv, char ** envp) {
     ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions", ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/api/chat",            ex_wrapper(routes.post_chat_completions)); // ollama specific endpoint
+    ctx_http.post("/v1/responses",        ex_wrapper(routes.post_responses_oai));
+    ctx_http.post("/responses",           ex_wrapper(routes.post_responses_oai));
     ctx_http.post("/v1/messages",         ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
     ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
     ctx_http.post("/infill",              ex_wrapper(routes.post_infill));
@@ -252,6 +255,7 @@ int main(int argc, char ** argv, char ** envp) {
             return 1;
         }
 
+        routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);
 
         LOG_INF("%s: model loaded\n", __func__);
